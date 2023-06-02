@@ -65,40 +65,21 @@ class ASREngine:
 
     def _prepare_naming_condition(self):
         naming_condition_pattern = [
-            "меня зовут",
-            "добрый день, меня зовут",
-            "всем привет, меня зовут",
-            "позвольте представиться",
-            "да, всем привет, я",
-            "зовут меня",
-            "представлюсь, меня зовут",
-            "давайте представлюсь, меня звать",
-            "позвольте представлюсь",
-            "давайте знакомиться, я",
-            "давайте знакомиться, меня зовут",
+            "меня зовут"
         ]
         self.NAMING_CONDITION = Parser(morph_pipeline(naming_condition_pattern))
 
     def _prepare_summary_parser(self):
         pattern_inceptum = [
-            'а теперь к итогам', 
-            'а теперь к выводам'
+            'подведем итоги'
         ]
         pattern_medium = [
             'во-первых',
             'во-вторых',
-            'в-третьих',
-            'в-четвертых',
-            'в-пятых',
-            'в-шестых',
-            'в-седьмых',
-            'в-восьмых',
-            'в-девятых',
-            'в-десятых',
+            'в-третьих'
         ]
         pattern_factus = [
-            'спасибо за внимание',
-            'готов ответить на вопросы'
+            'спасибо за внимание'
         ]
 
         self.INCEPTUM = Parser(morph_pipeline(pattern_inceptum))
@@ -161,87 +142,86 @@ class ASREngine:
             transcription = self._whisper_model.transcribe(
                 self._path_to_audio_prepared, language='ru', verbose=False
             )
-            dump_to_json(transcription, self._path_to_transcription)
-            whisper_timestamps = [
+            # dump_to_json(transcription, self._path_to_transcription)
+            with open(self._path_to_transcription, 'w') as f:
+                json.dump(transcription, f)
+            timestamps = [
                 {'start': item['start'], 'end': item['end']} 
                 for item in transcription['segments']
             ]
-        except Exception as e:
-            print('Can\'t transcribe audio')
-            raise e
+            break_down_audio(
+                self._path_to_audio_prepared,
+                timestamps, 
+                self._whisper_segments_dir
+            )
+        except:
+            raise Exception('Can\'t transcribe audio')
         
-        start = time.time()
         print('---Performing VAD---')
         try:
-            vad_result = self._get_vad_result(self._path_to_audio_prepared)
-            dump_to_json(vad_result, self._path_to_vad_result)
-            vad_segments = self._extend_vad_result_with_whisper(
-                whisper_timestamps, vad_result
+            segments_info = []
+            for i, seg in tqdm(enumerate(transcription['segments'])):
+                segment_filepath = os.path.join(self._whisper_segments_dir, f'{i}.wav')
+                current_vad_result = self._vad.get_precise_timestamps(
+                    segment_filepath
+                )
+                for item in current_vad_result:
+                    segments_info.append({
+                        'start': item['start'] + seg['start'],
+                        'end': item['end'] + seg['start'],
+                        'whisper_segment_id': i
+                    })    
+            # dump_to_json(segments_info, self._path_to_segments_info)
+            break_down_audio(
+                self._path_to_audio_prepared,
+                segments_info, 
+                self._vad_segments_dir
             )
-            dump_to_json(vad_segments, self._path_to_vad_segments)
-        except Exception as e:
-            print('Can\'t perform VAD on audio')
-            raise e
-        end = time.time()
-        get_duration(start, end)
-
-        break_down_audio(
-            self._path_to_audio_prepared,
-            vad_segments,
-            self._vad_segments_dir
-        )
+        except:
+            raise Exception('Can\'t perform VAD on audio')
 
         print('---Non speech segments inspection---')
         try:
-            is_speech_flags = self._inspect_for_non_speech(vad_segments)
-            for item, flag in zip(vad_segments, is_speech_flags):
+            is_speech_flags = self._inspect_for_non_speech(len(segments_info))
+            for item, flag in zip(segments_info, is_speech_flags):
                 item['is_speech'] = flag
             dump_to_json(is_speech_flags, self._path_to_speech_flags)
-        except Exception as e:
-            print('Can\'t perform non speech inspection')
-            raise e
+        except:
+            raise Exception('Can\'t perform non speech inspection')
 
         print('---Getting speaker embeddings---')
         try:
-            embeddings = self._get_embeddings(len(vad_segments))
+            embeddings = self._get_embeddings(len(segments_info))
             np.save(self._path_to_speech_embeddings, embeddings)
-        except Exception as e:
-            print('Can\'t get speaker embeddings')
-            raise e
-        
-        start = time.time()
+        except:
+            raise Exception('Can\'t get speaker embeddings')
+
         print('---Clustering segments---')
         try:
             segments_labels = self._clusterize(embeddings, n_speakers)
-            for item, label in zip(vad_segments, segments_labels):
+            for item, label in zip(segments_info, segments_labels):
                 item['speaker_label'] = label
-            dump_to_json(segments_labels, self._path_to_segments_labels)
-        except Exception as e:
-            print('Can\'t clusterize segment')
-            raise e
-        end = time.time()
-        get_duration(start, end)
+            np.save(self._path_to_segments_labels, segments_labels)
+        except:
+            raise Exception('Can\'t clusterize segment')
 
-        start = time.time()
-        print('---Matching segments with transcriptions---')
+        print('---Matching segments with transcriptions')
         try:
-            transcription_to_vad = self._match_whisper_with_vad(
-                vad_segments, transcription
+            speech_segments, non_speech_segments = self._clamp_non_speech_segments(
+                segments_info
             )
-            for text, segment in zip(transcription_to_vad, vad_segments):
-                segment['text'] = text
-        except Exception as e:
-            print('Can\'t match segments with transcriptions')
-            raise e
-        end = time.time()
-        get_duration(start, end)
+            speech_segments = self._match_segments_with_transcription(
+                speech_segments, non_speech_segments, transcription['segments']
+            )
+        except:
+            raise Exception('Can\'t match segments with transcriptions')
 
         start = time.time()
         print('---Postprocessing result---')
         try:   
             if self.clustering_method == 'DBSCAN':
                 n_speakers = max(set(segments_labels)) + 1
-            vad_segments_clamped = self._clamp_segments(vad_segments)
+            vad_segments_clamped = self._clamp_segments(speech_segments)
             if self.drop_empty:
                 vad_segments_final = self._drop_empty(vad_segments_clamped)
                 vad_segments_final = self._clamp_segments(vad_segments_final)
@@ -292,199 +272,190 @@ class ASREngine:
         print('Overall time')
         get_duration(transcription_start, transcription_end) 
 
-
-    """VAD"""
-    def _get_vad_result(self, path_to_audio: str) -> List[Dict]:
-        vad_result = self._vad.get_timestamps_in_seconds(
-            path_to_audio
-        )
-        vad_result_prolonged = self._prolong_vad_segments(vad_result)
-        return vad_result_prolonged
-
-    def _prolong_vad_segments(self, vad_results: List[Dict]) -> List[Dict]:
-        vad_results_n = []
-        PROLONGING_FACTOR = 0.250
-        for item in vad_results:
-            duration = item['end'] - item['start']
-            if duration < PROLONGING_FACTOR:
-                delta = (PROLONGING_FACTOR - duration) / 2
-                vad_results_n.append({
-                    'start': max(item['start'] - delta, 0),
-                    'end': item['end'] + delta
-                })
-            else:
-                vad_results_n.append({**item})
-        return vad_results_n
-
-    def _extend_vad_result_with_whisper(
-            self, whisper_timestamps: List[Dict], vad_result: List[Dict] 
-        ) -> List[Dict]:
-        whisper_to_vad_map = {}
-        for i, whisper_seg in enumerate(whisper_timestamps):
-            overlapped_vads = 0
-            w_seg = TimeInterval(start=whisper_seg['start'], end=whisper_seg['end'])
-            for vad_seg in vad_result:
-                v_seg = TimeInterval(start=vad_seg['start'], end=vad_seg['end'])
-                if w_seg.intersects(v_seg):
-                    overlapped_vads += 1
-            whisper_to_vad_map[i] = overlapped_vads
-        free_whisper_segs = [whisper_timestamps[i] 
-                                for i, overlapped_vads in whisper_to_vad_map.items()
-                                if overlapped_vads == 0]
-        vad_result_n = []
-        for item in vad_result:
-            item_n = {**item}
-            item_n['source'] = 'vad'
-            vad_result_n.append(item_n)
-        free_whisper_segs_n = []
-        for item in free_whisper_segs:
-            item_n = {**item}
-            item_n['source'] = 'whisper'
-            free_whisper_segs_n.append(item_n)
-        vad_segments = self._fuse_lists_by_field(
-            free_whisper_segs_n, vad_result_n, 'start'
-        )
-        return vad_segments
-
-    def _fuse_lists_by_field(
-            self, L_1: List[Dict], L_2: List[Dict], field: str
-        ) -> List[Dict]:
-        L_fused = []
-        i_1 = 0
-        i_2 = 0
-        while i_1 < len(L_1) and i_2 < len(L_2):
-            if L_1[i_1][field] <= L_2[i_2][field]:
-                L_fused.append(L_1[i_1])
-                i_1 += 1
-            else:
-                L_fused.append(L_2[i_2])
-                i_2 += 1
-        if i_1 == len(L_1):
-            L_fused += L_2[i_2:]
-        elif i_2 == len(L_2):
-            L_fused += L_1[i_1:]  
-        return L_fused
-    
-    """SPEECH DETECTION"""
-    def _inspect_for_non_speech(self, vad_segments: List[Dict]) -> List[bool]:
+    def _inspect_for_non_speech(self, n_segments: int):
         is_speech_flags = []
-        for i, item in tqdm(enumerate(vad_segments)):
-            if item['source'] == 'whisper':
+        for i in tqdm(range(n_segments)):
+            segment_filepath = os.path.join(self._vad_segments_dir, f'{i}.wav')
+            tr = self._whisper_model.transcribe(segment_filepath)
+            if tr['language'] == 'ru':
                 is_speech_flags.append(True)
             else:
-                segment_filepath = os.path.join(self._vad_segments_dir, f'{i}.wav')
-                tr = self._speech_detector.transcribe(segment_filepath)
-                if tr['language'] == 'ru':
-                    is_speech_flags.append(True)
-                else:
-                    is_speech_flags.append(False)
+                is_speech_flags.append(False)
         return is_speech_flags
-    
-    """SPEAKER MODELING"""
+
     def _get_embeddings(self, n_segments: int):
         embeddings = []
         for i in tqdm(range(n_segments)):
             segment_filepath = os.path.join(self._vad_segments_dir, f'{i}.wav')
-            try:
-                segment_embedding = self._speaker_model.get_embedding(segment_filepath)
-            except:
-                segment_embedding = np.zeros((1, 192))
+            segment_embedding = self._speaker_model.get_embedding(segment_filepath)
             embeddings.append(segment_embedding)
         embeddings = np.concatenate(embeddings, axis=0)
         return embeddings
-    
-    """CLUSTERING"""
-    def _clusterize(
-            self, embeddings: np.ndarray, n_speakers: int
-        ) -> List[int]:
+
+    def _clusterize(self, embeddings: np.ndarray, n_speakers: int):
         reducer = umap.UMAP()
+        clusterer = AgglomerativeClustering(n_speakers)
         embeddings_r = reducer.fit_transform(embeddings)
-        if self.clustering_method == 'AgCl':    
-            clusterer = AgglomerativeClustering(n_speakers)
-        elif self.clustering_method == 'DBSCAN':
-            clusterer = DBSCAN()
         clusterer.fit(embeddings_r)
-        if self.clustering_method == 'AgCl':    
-            labels = clusterer.labels_.tolist()
-        elif self.clustering_method == 'DBSCAN':
-            labels = [i+1 for i in clusterer.labels_.tolist()]
-        return labels
-    
-    """TRANSCRIPTION MATCHING"""
-    def _cross_associate_segments(
-            self, vad_segments: List[Dict], transcription: List[Dict]
-        ) -> Dict:
-        cross_association_table = {}
-        for whisper_segment in transcription['segments']:
-            w_seg = TimeInterval(
-                start=whisper_segment['start'], end=whisper_segment['end']
-            )
-            vad_segments_ids = []
-            for i in range(len(vad_segments)):
-                v_seg = TimeInterval(
-                    start=vad_segments[i]['start'], end=vad_segments[i]['end']
-                )
-                if w_seg.intersects(v_seg):
-                    vad_segments_ids.append(i)
-            cross_association_table[whisper_segment['id']] = vad_segments_ids
-        return cross_association_table
+        return clusterer.labels_
 
-    def _match_transcription(
-            self,
-            vad_segments: List[Dict], 
-            transcription: List[Dict],
-            cross_assossiation_table: List[Dict]
-        ) -> List[List[str]]:
-        transcription_to_vad = [None]*len(vad_segments)
-        v_segs = [TimeInterval(item['start'], item['end'])
-                for item in vad_segments]
-        for whisper_id, vad_segments_ids in cross_assossiation_table.items():
-            w_seg = TimeInterval(
-                start=transcription['segments'][whisper_id]['start'],
-                end=transcription['segments'][whisper_id]['end']
-            )
-            longest_speech_seg = {
-                'id': None, 'intersection': 0
-            }
-            longest_non_speech_seg = {
-                'id': None, 'intersection': 0
-            }
-            for vad_id in vad_segments_ids:
-                cur_intersection = w_seg._get_intersection(v_segs[vad_id])
-                if (vad_segments[vad_id]['is_speech']
-                    and cur_intersection > longest_speech_seg['intersection']):
-                    longest_speech_seg['id'] = vad_id
-                    longest_speech_seg['intersection'] = cur_intersection
-                elif (not vad_segments[vad_id]['is_speech']
-                    and cur_intersection > longest_non_speech_seg['intersection']):
-                    longest_non_speech_seg['id'] = vad_id
-                    longest_non_speech_seg['intersection'] = cur_intersection
-            if longest_speech_seg['id'] is not None:
-                idx = longest_speech_seg['id']
-            elif longest_non_speech_seg['id'] is not None:
-                idx = longest_non_speech_seg['id']
+    def _get_transcription_to_id_map(self, transcriptions: List[Dict]):
+        transcription_to_id = {
+            i: item['text'] for i, item in enumerate(transcriptions)
+        }
+        return transcription_to_id
+
+    def _find_longest_segment(self,speech_segments: List[Dict]):
+        durations = {
+            i: item['end'] - item['start']
+            for i, item in enumerate(speech_segments)
+        }
+        longest_segment_idx = sorted(durations.items(), key=lambda x: x[1])[-1][0]
+        return longest_segment_idx
+
+
+    def _process_speech_segments(self,speech_segments: List[Dict], transcription: str) -> List:
+        n_speakers = len(set([item['speaker_label'] for item in speech_segments]))
+        speakers_list = sorted(set([item['speaker_label'] for item in speech_segments]))
+        if n_speakers == 1:
+            processed_segments = [{
+                'start': speech_segments[0]['start'],
+                'end': speech_segments[-1]['end'],
+                'speaker_label': speech_segments[0]['speaker_label'],
+                'text': transcription
+            }]
+        else:
+            longest_segment_idx = self._find_longest_segment(speech_segments)
+            processed_segments = []
+            for i, item in enumerate(speech_segments):
+                if i == longest_segment_idx:
+                    processed_segments.append({
+                        'start': item['start'],
+                        'end': item['end'],
+                        'speaker_label': item['speaker_label'],
+                        'text': transcription
+                    })
+                else:
+                    processed_segments.append({
+                        'start': item['start'],
+                        'end': item['end'],
+                        'speaker_label': item['speaker_label'],
+                        'text': '<EMPTY>'
+                    })
+        return processed_segments
+
+    def _clamp_non_speech_segments(
+        self,
+        segments_info: List[Dict], 
+        clamping_eps: float = 0.5
+    ):
+        speech_segments = []
+        non_speech_segments = []
+        for item in segments_info:
+            if item['is_speech']:
+                speech_segments.append(item)
             else:
+                non_speech_segments.append(item)
+        segments_info_clamped = []
+        already_clamped = [False]*len(non_speech_segments)
+        for speech_segment in speech_segments:
+            left_border = max(speech_segment['start'] - clamping_eps, 0)
+            rigth_border = speech_segment['end'] + clamping_eps
+            for i, non_speech_segment in enumerate(non_speech_segments):
+                if already_clamped[i]:
+                    continue
+                if non_speech_segment['end'] < left_border:
+                    continue
+                elif ((non_speech_segment['end'] >= left_border)
+                        or (non_speech_segment['start'] <= rigth_border)):
+                    if ((non_speech_segment['speaker_label'] == speech_segment['speaker_label'])
+                        and (non_speech_segment['whisper_segment_id'] == speech_segment['whisper_segment_id'])):
+                        left_border = min(left_border, non_speech_segment['start'])
+                        rigth_border = max(rigth_border, non_speech_segment['end'])
+                elif non_speech_segment['start'] > rigth_border:
+                    break
+            speech_segment_ext = {**speech_segment}
+            speech_segment_ext['start'] = left_border
+            speech_segment_ext['end'] = rigth_border
+            segments_info_clamped.append(speech_segment_ext)
+        not_used_non_speech_segments = []
+        for is_used, item in zip(already_clamped, non_speech_segments):
+            if not is_used:
+                not_used_non_speech_segments.append(item)
+        return segments_info_clamped, not_used_non_speech_segments
+
+    def _match_segments_with_transcription(
+        self,
+        speech_segments: List[Dict],
+        non_speech_segments: List[Dict], 
+        transcriptions: List[Dict]
+    ):
+        matched_speech_segments = []
+        transcription_to_id = self._get_transcription_to_id_map(transcriptions)
+        cluster_label = speech_segments[0]['whisper_segment_id']
+        current_cluster = []
+        for item in speech_segments:
+            if item['whisper_segment_id'] == cluster_label:
+                current_cluster.append(item)
+            else:
+                non_speech_cluster = []
+                for item_ in non_speech_segments:
+                    if item_['whisper_segment_id'] == cluster_label:
+                        non_speech_cluster.append(item_)
+                if len(current_cluster) > 0:
+                    processable_cluster = current_cluster
+                else:
+                    processable_cluster = non_speech_cluster
+                matched_speech_segments += self._process_speech_segments(
+                    processable_cluster, transcription_to_id[cluster_label]
+                )
+                current_cluster = [item]
+                cluster_label = item['whisper_segment_id']
+        non_speech_cluster = []
+        for item_ in non_speech_segments:
+            if item_['whisper_segment_id'] == cluster_label:
+                non_speech_cluster.append(item_)
+        if len(current_cluster) > 0:
+            processable_cluster = current_cluster
+        else:
+            processable_cluster = non_speech_cluster
+        matched_speech_segments += self._process_speech_segments(
+            processable_cluster, transcription_to_id[cluster_label]
+        )
+        return matched_speech_segments
+
+    def _smooth_speech_segments(self, speech_segments: List[Dict], smoothing_eps: float = 0.5):
+        smoothed_segments = []
+        current_cluster = {**speech_segments[0]}
+        current_cluster['text'] = [speech_segments[0]['text']]
+        current_cluster['speaker_label'] = int(current_cluster['speaker_label'])
+        for i, item in enumerate(speech_segments):
+            if i == 0:
                 continue
-            if transcription_to_vad[idx] is not None:
-                transcription_to_vad[idx].append(
-                    transcription['segments'][whisper_id]['text']
-                )
+            if ((item['speaker_label'] == current_cluster['speaker_label'])
+                and (item['start'] <= item['end'] - smoothing_eps)):
+                current_cluster['end'] = item['end']
+                current_cluster['text'].append(item['text'])
             else:
-                transcription_to_vad[idx] = [
-                    transcription['segments'][whisper_id]['text']
-                ]
-        return transcription_to_vad
+                smoothed_segments.append(current_cluster)
+                current_cluster = {**item}
+                current_cluster['speaker_label'] = int(current_cluster['speaker_label'])
+                current_cluster['text'] = [item['text']]
+        smoothed_segments.append(current_cluster)
+        return smoothed_segments
 
-    def _match_whisper_with_vad(
-            self, vad_segments: List[Dict], transcription: List[Dict]
-        ) -> Dict:
-        cross_association_table = self._cross_associate_segments(
-            vad_segments, transcription
-        )
-        transcription_to_vad = self._match_transcription(
-            vad_segments, transcription, cross_association_table
-        )
-        return transcription_to_vad
+
+    def _remove_service_tokens(self, resulted_speech_segments: List[Dict]):
+        result = []
+        for item in resulted_speech_segments:
+            current_segment = {**item}
+            current_segment['text'] = []
+            for text_item in item['text']:
+                if len(re.sub('<EMPTY>', '', text_item)) > 0:
+                    current_segment['text'].append(text_item)
+            if len(current_segment['text']) > 0:
+                result.append(current_segment)
+        return result
     
     """POSTPROCESSING"""
     def _clamp_segments(
@@ -548,13 +519,15 @@ class ASREngine:
             else:
                 utterances_cut.append("---")
         speaker_labels = [item['speaker_label'] for item in vad_segments_post]
+        try:
+            ner_results = self.ner_model(utterances_cut)
+            fio_list = self._get_first_per_chains(ner_results)
 
-        ner_results = self.ner_model(utterances_cut)
-        fio_list = self._get_first_per_chains(ner_results)
-
-        label_to_name = self._match_speaker_with_name(
-            speaker_labels, fio_list, n_speakers
-        )
+            label_to_name = self._match_speaker_with_name(
+                speaker_labels, fio_list, n_speakers
+            )
+        except:
+            label_to_name = [None]*n_speakers
         return label_to_name
 
     def _get_first_per_chains(self, ner_results: List) -> List:
